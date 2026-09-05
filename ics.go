@@ -13,12 +13,15 @@ import (
 const icsTimeLayout = "20060102T150405Z"
 
 func parseICS(r io.Reader) ([]Fixture, error) {
-	scanner := bufio.NewScanner(r)
+	lines, err := unfoldICS(r)
+	if err != nil {
+		return nil, err
+	}
+
 	var fixtures []Fixture
 	var cur *Fixture
 
-	for scanner.Scan() {
-		line := strings.TrimRight(scanner.Text(), "\r")
+	for _, line := range lines {
 		switch {
 		case line == "BEGIN:VEVENT":
 			cur = &Fixture{}
@@ -51,10 +54,28 @@ func parseICS(r io.Reader) ([]Fixture, error) {
 			}
 		}
 	}
+	return fixtures, nil
+}
+
+// unfoldICS rejoins folded content lines. RFC 5545 lets a generator split
+// any line by inserting a CRLF followed by a single space or tab; readers
+// are required to undo that by dropping the CRLF and the leading whitespace
+// before parsing the line as KEY;PARAMS:VALUE.
+func unfoldICS(r io.Reader) ([]string, error) {
+	scanner := bufio.NewScanner(r)
+	var lines []string
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		if len(line) > 0 && (line[0] == ' ' || line[0] == '\t') && len(lines) > 0 {
+			lines[len(lines)-1] += line[1:]
+			continue
+		}
+		lines = append(lines, line)
+	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
-	return fixtures, nil
+	return lines, nil
 }
 
 // splitICSLine handles both "KEY:VALUE" and "KEY;PARAM=x:VALUE" forms.

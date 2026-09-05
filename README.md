@@ -44,8 +44,6 @@ that use `TZID` or floating local time aren't handled yet.
 
 ## Current limits
 
-- No line folding on parse: an ICS file with wrapped long lines (some
-  calendar exports do this) won't parse correctly yet.
 - No `RRULE` (recurring event) support — every fixture needs its own
   `VEVENT`.
 - Timezone handling is UTC-only in both directions.
