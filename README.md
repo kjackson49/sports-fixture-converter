@@ -39,14 +39,21 @@ columns.
 
 Each fixture becomes one `VEVENT`. `SUMMARY` is `<home> v <away>`,
 `LOCATION` is the venue, `CATEGORIES` carries the competition name.
-Times are read and written in UTC (a trailing `Z` on `DTSTART`) — feeds
-that use `TZID` or floating local time aren't handled yet.
+`DTSTART` is read as UTC (trailing `Z`), as a local time against a
+`TZID` parameter, or as floating time (no zone at all, taken to mean
+local time on this machine) — whichever the feed uses. On the way out,
+a fixture keeps whatever zone it was parsed with: UTC round-trips to
+`Z`, a named IANA zone round-trips to `TZID=<name>`. There's no
+`VTIMEZONE` block emitted for the `TZID` case, so it relies on the
+reader already knowing that zone rather than the file being fully
+self-contained.
 
 ## Current limits
 
 - No `RRULE` (recurring event) support — every fixture needs its own
   `VEVENT`.
-- Timezone handling is UTC-only in both directions.
+- No `VTIMEZONE` generation, so a `TZID` written out isn't fully
+  self-describing per RFC 5545.
 
 None of this is architecturally hard, it just hasn't been needed for
 the calendars I've fed it so far.

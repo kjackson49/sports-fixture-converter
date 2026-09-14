@@ -8,9 +8,10 @@ import (
 	"time"
 )
 
-// icsTimeLayout assumes UTC (a trailing Z), which is what most published
-// fixture calendars use. Local/floating times are a roadmap item.
-const icsTimeLayout = "20060102T150405Z"
+const (
+	icsUTCLayout   = "20060102T150405Z"
+	icsLocalLayout = "20060102T150405"
+)
 
 func parseICS(r io.Reader) ([]Fixture, error) {
 	lines, err := unfoldICS(r)
@@ -31,13 +32,13 @@ func parseICS(r io.Reader) ([]Fixture, error) {
 				cur = nil
 			}
 		case cur != nil:
-			key, val, ok := splitICSLine(line)
+			key, params, val, ok := parseICSLine(line)
 			if !ok {
 				continue
 			}
 			switch key {
 			case "DTSTART":
-				t, err := time.Parse(icsTimeLayout, val)
+				t, err := parseICSDateTime(val, params["TZID"])
 				if err != nil {
 					return nil, fmt.Errorf("parsing DTSTART %q: %w", val, err)
 				}
@@ -78,18 +79,59 @@ func unfoldICS(r io.Reader) ([]string, error) {
 	return lines, nil
 }
 
-// splitICSLine handles both "KEY:VALUE" and "KEY;PARAM=x:VALUE" forms.
-// Parameters (TZID and friends) are dropped rather than interpreted.
-func splitICSLine(line string) (key, val string, ok bool) {
+// parseICSLine handles both "KEY:VALUE" and "KEY;PARAM=x;PARAM2=y:VALUE"
+// forms, returning the bare key and any parameters (TZID and friends).
+func parseICSLine(line string) (key string, params map[string]string, val string, ok bool) {
 	colon := strings.Index(line, ":")
 	if colon < 0 {
-		return "", "", false
+		return "", nil, "", false
 	}
-	key, val = line[:colon], line[colon+1:]
-	if semi := strings.Index(key, ";"); semi >= 0 {
-		key = key[:semi]
+	head, val := line[:colon], line[colon+1:]
+	parts := strings.Split(head, ";")
+	key = parts[0]
+	if len(parts) > 1 {
+		params = make(map[string]string, len(parts)-1)
+		for _, p := range parts[1:] {
+			if k, v, ok := strings.Cut(p, "="); ok {
+				params[k] = v
+			}
+		}
 	}
-	return key, val, true
+	return key, params, val, true
+}
+
+// parseICSDateTime parses a DTSTART value per RFC 5545 §3.3.5: a trailing
+// Z means UTC, a TZID parameter means the value is local wall-clock time in
+// that IANA zone, and neither means "floating" time with no assigned zone,
+// which we interpret as local time on this machine since that's the closest
+// stand-in for "whatever timezone the viewer is in".
+func parseICSDateTime(val, tzid string) (time.Time, error) {
+	if strings.HasSuffix(val, "Z") {
+		return time.Parse(icsUTCLayout, val)
+	}
+	if tzid != "" {
+		loc, err := time.LoadLocation(tzid)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("loading TZID %q: %w", tzid, err)
+		}
+		return time.ParseInLocation(icsLocalLayout, val, loc)
+	}
+	return time.ParseInLocation(icsLocalLayout, val, time.Local)
+}
+
+// formatICSDateTime is the inverse of parseICSDateTime: UTC times get the
+// trailing-Z form, times in a named IANA zone get a TZID parameter, and
+// anything else (e.g. the unnamed time.Local zone) falls back to UTC so the
+// written value is never ambiguous. Note this doesn't emit a VTIMEZONE
+// block, so a TZID here relies on the reader recognizing the zone name
+// itself rather than the file being fully self-contained per RFC 5545.
+func formatICSDateTime(t time.Time) (key, val string) {
+	if loc := t.Location(); loc != time.UTC {
+		if name := loc.String(); name != "" && name != "Local" {
+			return "DTSTART;TZID=" + name, t.Format(icsLocalLayout)
+		}
+	}
+	return "DTSTART", t.UTC().Format(icsUTCLayout)
 }
 
 func unescapeICS(s string) string {
@@ -110,7 +152,8 @@ func writeICS(w io.Writer, fixtures []Fixture) error {
 	for i, f := range fixtures {
 		fmt.Fprintln(bw, "BEGIN:VEVENT")
 		fmt.Fprintf(bw, "UID:fixconv-%d@local\n", i)
-		fmt.Fprintf(bw, "DTSTART:%s\n", f.Date.UTC().Format(icsTimeLayout))
+		dtKey, dtVal := formatICSDateTime(f.Date)
+		fmt.Fprintf(bw, "%s:%s\n", dtKey, dtVal)
 		fmt.Fprintf(bw, "SUMMARY:%s\n", escapeICS(f.HomeTeam+" v "+f.AwayTeam))
 		if f.Venue != "" {
 			fmt.Fprintf(bw, "LOCATION:%s\n", escapeICS(f.Venue))
