@@ -48,10 +48,16 @@ a fixture keeps whatever zone it was parsed with: UTC round-trips to
 reader already knowing that zone rather than the file being fully
 self-contained.
 
+A `VEVENT` with an `RRULE` is expanded into one fixture per occurrence.
+Only `FREQ=DAILY` and `FREQ=WEEKLY` are understood (weekly optionally
+with `BYDAY`), and the rule must be bounded with `COUNT` or `UNTIL` —
+there's no way to write out an open-ended recurrence as CSV rows.
+
 ## Current limits
 
-- No `RRULE` (recurring event) support — every fixture needs its own
-  `VEVENT`.
+- `RRULE` support is limited to `FREQ=DAILY`/`WEEKLY`, no monthly or
+  yearly rules, no `BYMONTHDAY`/ordinal `BYDAY` (`1MO`, `-1FR`), and no
+  `EXDATE` exceptions.
 - No `VTIMEZONE` generation, so a `TZID` written out isn't fully
   self-describing per RFC 5545.
 

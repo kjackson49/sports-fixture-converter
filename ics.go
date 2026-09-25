@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,14 +23,28 @@ func parseICS(r io.Reader) ([]Fixture, error) {
 
 	var fixtures []Fixture
 	var cur *Fixture
+	var rrule string
 
 	for _, line := range lines {
 		switch {
 		case line == "BEGIN:VEVENT":
 			cur = &Fixture{}
+			rrule = ""
 		case line == "END:VEVENT":
 			if cur != nil {
-				fixtures = append(fixtures, *cur)
+				if rrule == "" {
+					fixtures = append(fixtures, *cur)
+				} else {
+					occurrences, err := expandRRULE(cur.Date, rrule)
+					if err != nil {
+						return nil, fmt.Errorf("expanding RRULE %q: %w", rrule, err)
+					}
+					for _, t := range occurrences {
+						f := *cur
+						f.Date = t
+						fixtures = append(fixtures, f)
+					}
+				}
 				cur = nil
 			}
 		case cur != nil:
@@ -52,10 +68,158 @@ func parseICS(r io.Reader) ([]Fixture, error) {
 				cur.Venue = unescapeICS(val)
 			case "CATEGORIES":
 				cur.Competition = unescapeICS(val)
+			case "RRULE":
+				rrule = val
 			}
 		}
 	}
 	return fixtures, nil
+}
+
+// icsRRULEWeekday maps the two-letter BYDAY codes from RFC 5545 §3.3.10 to
+// their time.Weekday. Ordinal prefixes (e.g. "1MO", "-1FR") aren't
+// supported since they only mean something for monthly/yearly rules.
+var icsRRULEWeekday = map[string]time.Weekday{
+	"SU": time.Sunday, "MO": time.Monday, "TU": time.Tuesday, "WE": time.Wednesday,
+	"TH": time.Thursday, "FR": time.Friday, "SA": time.Saturday,
+}
+
+// expandRRULE turns an RRULE value into the concrete occurrence times it
+// describes, starting from dtstart. Only FREQ=DAILY and FREQ=WEEKLY are
+// supported (optionally with BYDAY for weekly), which is what recurring
+// fixtures actually use in practice — a match every N days, or on set
+// weekdays each week. The rule must be bounded by COUNT or UNTIL; RFC 5545
+// allows open-ended recurrence but we can't emit an infinite CSV.
+func expandRRULE(dtstart time.Time, rrule string) ([]time.Time, error) {
+	const maxOccurrences = 1000
+
+	var freq string
+	interval := 1
+	count := 0
+	var until time.Time
+	hasUntil := false
+	var byday []time.Weekday
+
+	for _, part := range strings.Split(rrule, ";") {
+		k, v, ok := strings.Cut(part, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "FREQ":
+			freq = v
+		case "INTERVAL":
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return nil, fmt.Errorf("invalid INTERVAL %q", v)
+			}
+			interval = n
+		case "COUNT":
+			n, err := strconv.Atoi(v)
+			if err != nil || n < 1 {
+				return nil, fmt.Errorf("invalid COUNT %q", v)
+			}
+			count = n
+		case "UNTIL":
+			t, err := parseRRULEUntil(v)
+			if err != nil {
+				return nil, fmt.Errorf("invalid UNTIL %q: %w", v, err)
+			}
+			until = t
+			hasUntil = true
+		case "BYDAY":
+			for _, d := range strings.Split(v, ",") {
+				wd, ok := icsRRULEWeekday[d]
+				if !ok {
+					return nil, fmt.Errorf("unsupported BYDAY value %q", d)
+				}
+				byday = append(byday, wd)
+			}
+		}
+	}
+
+	switch freq {
+	case "DAILY", "WEEKLY":
+	case "":
+		return nil, fmt.Errorf("RRULE is missing FREQ")
+	default:
+		return nil, fmt.Errorf("unsupported FREQ %q (only DAILY and WEEKLY are)", freq)
+	}
+	if freq == "DAILY" && len(byday) > 0 {
+		return nil, fmt.Errorf("BYDAY is only supported with FREQ=WEEKLY")
+	}
+	if count == 0 && !hasUntil {
+		return nil, fmt.Errorf("RRULE needs COUNT or UNTIL, open-ended recurrence isn't supported")
+	}
+
+	if len(byday) == 0 {
+		step := 24 * time.Hour
+		if freq == "WEEKLY" {
+			step = 7 * 24 * time.Hour
+		}
+		var times []time.Time
+		for t := dtstart; ; t = t.Add(step * time.Duration(interval)) {
+			if hasUntil && t.After(until) {
+				break
+			}
+			times = append(times, t)
+			if count > 0 && len(times) >= count {
+				break
+			}
+			if len(times) >= maxOccurrences {
+				return nil, fmt.Errorf("RRULE expands past %d occurrences", maxOccurrences)
+			}
+		}
+		return times, nil
+	}
+
+	// FREQ=WEEKLY with BYDAY: walk week by week from the Sunday on or
+	// before dtstart, emitting one occurrence per matching weekday that
+	// falls on or after dtstart.
+	weekStart := dtstart.AddDate(0, 0, -int(dtstart.Weekday()))
+	var times []time.Time
+	for week := 0; ; week += interval {
+		base := weekStart.AddDate(0, 0, week*7)
+		for _, wd := range byday {
+			occDay := base.AddDate(0, 0, int(wd))
+			occ := time.Date(occDay.Year(), occDay.Month(), occDay.Day(),
+				dtstart.Hour(), dtstart.Minute(), dtstart.Second(), 0, dtstart.Location())
+			if occ.Before(dtstart) {
+				continue
+			}
+			if hasUntil && occ.After(until) {
+				continue
+			}
+			times = append(times, occ)
+		}
+		if len(times) >= maxOccurrences {
+			return nil, fmt.Errorf("RRULE expands past %d occurrences", maxOccurrences)
+		}
+		if hasUntil && base.After(until) {
+			break
+		}
+		if count > 0 && len(times) >= count {
+			break
+		}
+	}
+
+	sort.Slice(times, func(i, j int) bool { return times[i].Before(times[j]) })
+	if count > 0 && len(times) > count {
+		times = times[:count]
+	}
+	return times, nil
+}
+
+// parseRRULEUntil parses an RRULE UNTIL value, which per RFC 5545 is
+// either a UTC date-time (trailing Z) or, less commonly, a bare date.
+func parseRRULEUntil(val string) (time.Time, error) {
+	if strings.HasSuffix(val, "Z") {
+		return time.Parse(icsUTCLayout, val)
+	}
+	if len(val) == 8 {
+		return time.Parse("20060102", val)
+	}
+	return time.ParseInLocation(icsLocalLayout, val, time.Local)
 }
 
 // unfoldICS rejoins folded content lines. RFC 5545 lets a generator split
